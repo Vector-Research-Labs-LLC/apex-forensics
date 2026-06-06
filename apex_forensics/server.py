@@ -258,6 +258,162 @@ Enumerate network endpoints and connections from a Windows memory image
     }
 
 
+
+
+# --- windows.malfind parser, classifier, and tool --------------------------
+
+# Processes commonly flagged by malfind as a false positive due to JIT.
+# Lowercase comparison. The classifier downgrades these to 'uncertain'.
+_JIT_PROCESS_NAMES = {
+    "msmpeng.exe", "msmpengcp.exe",       # Windows Defender
+    "teams.exe", "ms-teams.exe",           # Electron
+    "code.exe", "discord.exe", "slack.exe",  # Electron
+    "msedge.exe", "chrome.exe", "firefox.exe",  # Browsers
+    "searchapp.exe", "startmenuexperiencehost.exe", "shellexperiencehost.exe",
+    "applicationframehost.exe", "runtimebroker.exe",  # UWP shims
+    "powershell.exe", "powershell_ise.exe",
+    "devenv.exe", "dotnet.exe",            # .NET dev tooling
+}
+
+
+def _parse_malfind(stdout):
+    """
+    Parse `windows.malfind` plugin output into per-region findings.
+    Vol3 emits a header row, then alternating data rows and hex dumps.
+    We capture: PID, Process, Start VPN, End VPN, Tag, Protection, CommitCharge, PrivateMemory, Notes, HasMZHeader.
+    """
+    lines = stdout.splitlines()
+    findings = []
+    header_seen = False
+    current = None
+    for line in lines:
+        if not line.strip():
+            continue
+        if line.startswith("Volatility") or line.startswith("Progress"):
+            continue
+        if not header_seen:
+            if line.lstrip().startswith("PID"):
+                header_seen = True
+            continue
+        if set(line.strip()) <= set("*-= "):
+            continue
+
+        # A data row begins with a numeric PID.
+        first = line.split(None, 1)[0]
+        if first.isdigit():
+            if current is not None:
+                findings.append(current)
+            parts = line.split()
+            try:
+                current = {
+                    "pid": int(parts[0]),
+                    "process": parts[1],
+                    "start_vpn": parts[2] if len(parts) > 2 else None,
+                    "end_vpn": parts[3] if len(parts) > 3 else None,
+                    "tag": parts[4] if len(parts) > 4 else None,
+                    "protection": parts[5] if len(parts) > 5 else None,
+                    "commit_charge": parts[6] if len(parts) > 6 else None,
+                    "private_memory": parts[7] if len(parts) > 7 else None,
+                    "notes": " ".join(parts[8:]) if len(parts) > 8 else None,
+                    "has_mz_header": False,
+                }
+            except (ValueError, IndexError):
+                current = None
+            continue
+
+        # Continuation / hex-dump lines for the current region.
+        if current is None:
+            continue
+        stripped = line.strip()
+        # Disassembly disasm lines look like '0x...:  ...'.
+        # Hex-dump lines start with offset bytes; the first 2 bytes after
+        # the offset will read '4d 5a' if a PE header is present.
+        if " 4d 5a " in line.lower() or line.lower().lstrip().startswith("4d 5a"):
+            current["has_mz_header"] = True
+
+    if current is not None:
+        findings.append(current)
+    return findings
+
+
+def _classify_malfind(region):
+    """
+    Assign per-region confidence:
+      - 'uncertain' if the owning process is in the JIT/false-positive list,
+      - 'inferred' otherwise (real injection still needs human confirmation),
+    Returns (confidence, reason).
+    """
+    proc = (region.get("process") or "").lower()
+    if proc in _JIT_PROCESS_NAMES:
+        return ("uncertain",
+                "owning process is a known JIT/Electron/Defender false-positive source")
+    if region.get("has_mz_header"):
+        return ("inferred",
+                "RWX region contains PE header (MZ) bytes — possible reflective load")
+    return ("inferred",
+            "RWX region without PE header — possible shellcode, not confirmed")
+
+
+@mcp.tool()
+def find_injected_code(image_path):
+    """
+    Search a Windows memory image for potentially injected/anomalous code
+    regions using Volatility 3 windows.malfind.
+
+    Per-region findings carry an INDIVIDUAL confidence tag:
+      - 'inferred'  : RWX region in a non-JIT process
+      - 'uncertain' : owning process is on the known-JIT/false-positive list
+
+    No malfind hit is automatically 'confirmed' — confirmation requires
+    correlation with disk artifacts, hash/signature, and human review.
+
+    Args:
+        image_path: Absolute path to a raw memory image under /cases/.
+
+    Returns:
+        {"region_count": int, "regions": [...with per-region confidence...],
+         "confidence_counts": {"inferred": N, "uncertain": M},
+         "receipt_seq": int, "receipt_hash": str}
+    """
+    image = _validate_evidence_path(image_path)
+    stdout = _run_vol_plugin(image, "windows.malfind")
+    regions = _parse_malfind(stdout)
+    for r in regions:
+        conf, reason = _classify_malfind(r)
+        r["confidence"] = conf
+        r["confidence_reason"] = reason
+
+    confidence_counts = {"inferred": 0, "uncertain": 0}
+    for r in regions:
+        confidence_counts[r["confidence"]] = confidence_counts.get(r["confidence"], 0) + 1
+
+    # The tool-level receipt is recorded with the LOWEST confidence present,
+    # so the ledger never overclaims at the tool level.
+    overall_conf = "uncertain" if confidence_counts.get("uncertain", 0) > 0 else "inferred"
+
+    parsed = {
+        "region_count": len(regions),
+        "regions": regions,
+        "confidence_counts": confidence_counts,
+    }
+
+    receipt = ledger.record(
+        tool="windows.malfind",
+        args={"image": str(image)},
+        raw_output=stdout,
+        parsed_finding=parsed,
+        confidence=overall_conf,
+    )
+
+    return {
+        "region_count": len(regions),
+        "regions": regions,
+        "confidence_counts": confidence_counts,
+        "receipt_seq": receipt["seq"],
+        "receipt_hash": receipt["this_hash"],
+    }
+
+
 # --- entrypoint ------------------------------------------------------------
 
 if __name__ == "__main__":
