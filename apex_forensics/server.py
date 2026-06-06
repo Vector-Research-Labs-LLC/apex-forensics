@@ -414,6 +414,179 @@ def find_injected_code(image_path):
     }
 
 
+
+
+# --- self-correction tool (criterion 1: autonomous execution quality) ------
+
+# Hand-authored expectation rules. Each rule is:
+#   (trigger_tool, trigger_predicate, expected_followup_tool, gap_description)
+# Transparent and inspectable — a senior analyst would write this list.
+_COVERAGE_RULES = [
+    {
+        "trigger_tool": "windows.netscan",
+        "trigger": lambda parsed: any(
+            (e.get("local_port") == 3389 or e.get("foreign_port") == 3389)
+            for e in parsed.get("endpoints", [])
+        ),
+        "expected_followup": "windows.sessions",
+        "gap": "RDP port-3389 activity observed; logon-session enumeration "
+               "(windows.sessions) is needed to determine whether any session "
+               "actually authenticated. APEX has not yet wrapped windows.sessions.",
+    },
+    {
+        "trigger_tool": "windows.netscan",
+        "trigger": lambda parsed: parsed.get("established_count", 0) > 0,
+        "expected_followup": "windows.netstat",
+        "gap": "ESTABLISHED TCP connections present; netstat correlation "
+               "(windows.netstat) recommended to confirm scanner findings "
+               "against the live socket table. Not yet wrapped.",
+    },
+    {
+        "trigger_tool": "windows.malfind",
+        "trigger": lambda parsed: any(
+            r.get("confidence") == "inferred"
+            for r in parsed.get("regions", [])
+        ),
+        "expected_followup": "windows.dlllist",
+        "gap": "malfind reported one or more 'inferred' (non-JIT) RWX regions; "
+               "DLL enumeration on those PIDs (windows.dlllist --pid <PID>) is "
+               "needed to determine loaded module set. Not yet wrapped.",
+    },
+    {
+        "trigger_tool": "windows.pslist",
+        "trigger": lambda parsed: parsed.get("process_count", 0) > 0,
+        "expected_followup": "windows.pstree",
+        "gap": "Process list enumerated but parent-child tree (windows.pstree) "
+               "not built; orphaned processes / suspicious parents are not "
+               "detectable from pslist alone. Not yet wrapped.",
+    },
+]
+
+
+def _read_session_receipts():
+    """Read all receipts from the ledger as parsed dicts."""
+    import sqlite3, json
+    db = ledger._require_open()
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT seq, tool, args_json, parsed_json, confidence, this_hash "
+            "FROM receipts ORDER BY seq ASC"
+        ).fetchall()
+    return [
+        {
+            "seq": seq,
+            "tool": tool,
+            "args": json.loads(args_json),
+            "parsed": json.loads(parsed_json),
+            "confidence": confidence,
+            "this_hash": this_hash,
+        }
+        for (seq, tool, args_json, parsed_json, confidence, this_hash) in rows
+    ]
+
+
+@mcp.tool()
+def self_correct(image_path: str) -> dict[str, Any]:
+    """
+    Audit the prior tool-call sequence in the ledger and emit a structured
+    'gaps and next steps' meta-finding. Does NOT re-run forensic tools or
+    touch the image; reads the ledger only.
+
+    This implements the self-correction discipline: the agent reviews its
+    own audit trail, identifies uncertain findings and coverage gaps, and
+    writes the audit *itself* as a receipt — making meta-reasoning part
+    of the chain of custody.
+
+    Args:
+        image_path: The image being investigated (recorded in the receipt
+                    for traceability; not opened or analyzed).
+
+    Returns:
+        {"reviewed_receipt_count": int,
+         "uncertainty_summary": [{"seq", "tool", "confidence", "what"}, ...],
+         "coverage_gaps":       [{"after_seq", "trigger_tool", "expected", "gap"}, ...],
+         "recommended_next_steps": [str, ...],
+         "receipt_seq": int, "receipt_hash": str}
+    """
+    image = _validate_evidence_path(image_path)
+    receipts = _read_session_receipts()
+
+    # 1. Surface uncertainty across all prior receipts.
+    uncertainty_summary = []
+    for r in receipts:
+        # Tool-level uncertainty
+        if r["confidence"] in ("inferred", "uncertain"):
+            uncertainty_summary.append({
+                "seq": r["seq"],
+                "tool": r["tool"],
+                "confidence": r["confidence"],
+                "what": "tool-level: overall finding tagged " + r["confidence"],
+            })
+        # Per-finding uncertainty (malfind regions, etc.)
+        for region in r["parsed"].get("regions", []):
+            if region.get("confidence") in ("inferred", "uncertain"):
+                uncertainty_summary.append({
+                    "seq": r["seq"],
+                    "tool": r["tool"],
+                    "confidence": region["confidence"],
+                    "what": "per-finding: PID " + str(region.get("pid"))
+                            + " (" + str(region.get("process")) + ") — "
+                            + str(region.get("confidence_reason", "")),
+                })
+
+    # 2. Coverage gaps: rules whose trigger fired but expected followup missing.
+    tools_called = {r["tool"] for r in receipts}
+    coverage_gaps = []
+    for rule in _COVERAGE_RULES:
+        triggered = False
+        trigger_seq = None
+        for r in receipts:
+            if r["tool"] != rule["trigger_tool"]:
+                continue
+            try:
+                if rule["trigger"](r["parsed"]):
+                    triggered = True
+                    trigger_seq = r["seq"]
+                    break
+            except Exception:
+                continue
+        if triggered and rule["expected_followup"] not in tools_called:
+            coverage_gaps.append({
+                "after_seq": trigger_seq,
+                "trigger_tool": rule["trigger_tool"],
+                "expected": rule["expected_followup"],
+                "gap": rule["gap"],
+            })
+
+    recommended_next_steps = [g["gap"] for g in coverage_gaps]
+
+    parsed = {
+        "reviewed_receipt_count": len(receipts),
+        "uncertainty_summary": uncertainty_summary,
+        "coverage_gaps": coverage_gaps,
+        "recommended_next_steps": recommended_next_steps,
+    }
+
+    # The self-correction receipt is itself 'confirmed' (it is a deterministic
+    # audit of the ledger), but the gaps it surfaces are not.
+    receipt = ledger.record(
+        tool="apex.self_correct",
+        args={"image": str(image), "reviewed_seqs": [r["seq"] for r in receipts]},
+        raw_output=str(parsed),
+        parsed_finding=parsed,
+        confidence="confirmed",
+    )
+
+    return {
+        "reviewed_receipt_count": len(receipts),
+        "uncertainty_summary": uncertainty_summary,
+        "coverage_gaps": coverage_gaps,
+        "recommended_next_steps": recommended_next_steps,
+        "receipt_seq": receipt["seq"],
+        "receipt_hash": receipt["this_hash"],
+    }
+
+
 # --- entrypoint ------------------------------------------------------------
 
 if __name__ == "__main__":
