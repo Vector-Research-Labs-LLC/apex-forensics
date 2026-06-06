@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apex-forensics"
+version = "0.1.0"
+description = "Read-only MCP server with hash-chained provenance ledger for AI-assisted forensic triage"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Jason Wold", email = "Jason.wold@vectorresearchlabs.com"}]
+dependencies = [
+    "mcp>=1.0",
+    "volatility3>=2.0",
+]
+
+[project.scripts]
+apex-forensics-server = "apex_forensics.server:mcp.run"
+
+[tool.setuptools.packages.find]
+include = ["apex_forensics*"]
