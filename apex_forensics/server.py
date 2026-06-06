@@ -159,6 +159,105 @@ def list_processes(image_path: str) -> dict[str, Any]:
     }
 
 
+
+
+# --- windows.netscan parser and tool ---------------------------------------
+
+def _parse_netscan(stdout: str) -> list[dict[str, Any]]:
+    """
+    Parse `windows.netscan` plugin output into a list of network endpoint dicts.
+    Columns (Vol3): Offset, Proto, LocalAddr, LocalPort, ForeignAddr, ForeignPort, State, PID, Owner, Created.
+    Lines with empty/dash values are normalized to None.
+    """
+    lines = stdout.splitlines()
+    rows: list[dict[str, Any]] = []
+    header_seen = False
+    for line in lines:
+        if not line.strip():
+            continue
+        if line.startswith("Volatility") or line.startswith("Progress"):
+            continue
+        if not header_seen:
+            if line.lstrip().startswith("Offset"):
+                header_seen = True
+            continue
+        if set(line.strip()) <= set("*-= "):
+            continue
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        try:
+            def _opt(v):
+                return None if v in ("-", "*", "") else v
+            def _opt_int(v):
+                try:
+                    return int(v)
+                except (ValueError, TypeError):
+                    return None
+            rows.append({
+                "offset": parts[0],
+                "proto": parts[1],
+                "local_addr": _opt(parts[2]),
+                "local_port": _opt_int(parts[3]),
+                "foreign_addr": _opt(parts[4]) if len(parts) > 4 else None,
+                "foreign_port": _opt_int(parts[5]) if len(parts) > 5 else None,
+                "state": _opt(parts[6]) if len(parts) > 6 else None,
+                "pid": _opt_int(parts[7]) if len(parts) > 7 else None,
+                "owner": parts[8] if len(parts) > 8 else None,
+            })
+        except (ValueError, IndexError):
+            continue
+    return rows
+
+
+@mcp.tool()
+def list_network_connections(image_path: str) -> dict[str, Any]:
+    """
+Enumerate network endpoints and connections from a Windows memory image
+    using Volatility 3 windows.netscan. Returns sockets, listening ports,
+    and established/closed TCP connections.
+
+    Args:
+        image_path: Absolute path to a raw memory image under /cases/.
+
+    Returns:
+        {"endpoint_count": int, "endpoints": [{proto, local_addr, local_port,
+         foreign_addr, foreign_port, state, pid, owner, ...}, ...],
+         "established_count": int, "listening_count": int,
+         "receipt_seq": int, "receipt_hash": str}
+    """
+    image = _validate_evidence_path(image_path)
+    stdout = _run_vol_plugin(image, "windows.netscan")
+    endpoints = _parse_netscan(stdout)
+
+    established = sum(1 for e in endpoints if (e.get("state") or "").upper() == "ESTABLISHED")
+    listening = sum(1 for e in endpoints if (e.get("state") or "").upper() == "LISTENING")
+
+    parsed = {
+        "endpoint_count": len(endpoints),
+        "established_count": established,
+        "listening_count": listening,
+        "endpoints": endpoints,
+    }
+
+    receipt = ledger.record(
+        tool="windows.netscan",
+        args={"image": str(image)},
+        raw_output=stdout,
+        parsed_finding=parsed,
+        confidence="confirmed",
+    )
+
+    return {
+        "endpoint_count": len(endpoints),
+        "established_count": established,
+        "listening_count": listening,
+        "endpoints": endpoints,
+        "receipt_seq": receipt["seq"],
+        "receipt_hash": receipt["this_hash"],
+    }
+
+
 # --- entrypoint ------------------------------------------------------------
 
 if __name__ == "__main__":
